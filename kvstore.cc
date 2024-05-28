@@ -1,56 +1,131 @@
 #include "kvstore.h"
 #include "utils.h"
+#include <cstdio>
+#include <cstring>
+#include <fcntl.h>
+#include <ios>
 #include <iostream>
+#include <unistd.h>
 using namespace std;
 
 /* ******************** my utils ******************** */
-u64 loadint(u8 *bytes, int n) {
-    // little endian load
+// little endian load
+u64 loadu(u8 *bytes, int n) {
     u64 val = 0;
     for (int i = 0; i < n; i++) {
         val = (val << 8) + bytes[n - i - 1];
     }
     return val;
 }
-/* ******************** my utils ******************** */
 
-Skiplist::Skiplist() {
-    head = new SSEntry(-1, -1, -1);
+// store in little endian
+void storeu(u8 *bytes, u64 value, int n) {
+    for (int i = 0; i < n; i++) {
+        bytes[i] = value & 0xff;
+        value = (value >> 8);
+    }
+}
+
+bool
+compare_ssentry(const SSEntry &sent1, const SSEntry &sent2) {
+    return sent1.key < sent2.key;
+}
+
+// read a sstable header from given filename
+int
+readSSTheader(const std::string &filename, SSTableHead &head) {
+    int fd;
+    u8 bytes[32];
+
+    fd = open(filename.c_str(), O_RDONLY);
+    read(fd, bytes, 32);
+    head.timestamp = loadu(bytes, 8);
+    head.cnt = loadu(bytes + 8, 8);
+    head.minkey = loadu(bytes + 16, 8);
+    head.maxkey = loadu(bytes + 24, 8);
+    close(fd);
+    return 1;
+}
+
+// get sstable filenames from given level
+int getsstfiles(const string &dir, int level, vector<string> &sstfiles) {
+    vector<string> files;
+    string subdir = dir + "/" + to_string(level) + "/";
+
+    sstfiles.clear();
+    if (!utils::dirExists(subdir)) {
+        return -1;
+    }
+    utils::scanDir(subdir, files);
+    for (string file : files) {
+        size_t len = file.length();
+        if (len >= 4 && file.substr(len-4).compare(".sst") == 0) {
+            sstfiles.push_back(subdir + file);
+        }
+    }
+    return 0;
+}
+
+/* ******************** MemTable ******************** */
+MemTable::MemTable() {
+    head = new MemEntry(-1, -1, -1);
     maxLevel = 1;
     dis = std::uniform_real_distribution<double>(0.0, 1.0);
+    size = 0;
+}
+
+MemTable::~MemTable() {
+    MemEntry *cur = head, *next;
+    while (cur) {
+        next = cur->forward[0];
+        delete cur;
+        cur = next;
+    }
 }
 
 
 // the next of the closet less element
-SSEntry *
-Skiplist::search(u64 key) {
-    SSEntry *cur = this->head;
+MemEntry *
+MemTable::search_less(u64 key) {
+    MemEntry *cur = this->head;
 
     for (int i = maxLevel; i >= 0; i--) {
         if (!cur->forward[i])
             continue;
-        while (cur->forward[i] && cur->forward[i]->key < key) {
+        while (cur->forward[i] && cur->forward[i]->sent.key < key) {
             cur = cur->forward[i];
         }
     }
     return cur->forward[0];
 }
-SSEntry *
-Skiplist::search_equ(u64 key) {
-    SSEntry *cur = search(key);
+
+// return when the key exists, may be dead
+MemEntry *
+MemTable::search(u64 key) {
+    MemEntry *cur = search_less(key);
     
-    if (cur && cur->key == key) {
+    if (cur && cur->sent.key == key) {
         return cur;
     }
     return nullptr;
 }
 
-SSEntry *
-Skiplist::add(u64 key) {
-    std::vector<SSEntry *> updates(MAX_SKIPLIST_LEVEL, head);
-    SSEntry *cur = this->head;
+// return when the key is live
+MemEntry *
+MemTable::search_live(u64 key) {
+    MemEntry *cur = search(key);
+    if (cur && cur->dead == false) {
+        return cur;
+    }
+    return nullptr;
+}
+
+MemEntry *
+MemTable::add(u64 key) {
+    std::vector<MemEntry *> updates(MAX_SKIPLIST_LEVEL, head);
+    MemEntry *cur = this->head;
     for (int i = maxLevel - 1; i >= 0; i--) {
-        while (cur->forward[i] && cur->forward[i]->key < key) {
+        while (cur->forward[i] && cur->forward[i]->sent.key < key) {
         cur = cur->forward[i];
         }
         updates[i] = cur;
@@ -59,16 +134,17 @@ Skiplist::add(u64 key) {
     int lv = randomLv();
     maxLevel = std::max(lv, maxLevel);
     // the new node
-    SSEntry *newnode = new SSEntry(key, -1, -1, lv);
+    MemEntry *newnode = new MemEntry(key, -1, -1, false, lv);
     for (int i = 0; i < lv; i++) {
         
         newnode->forward[i] = updates[i]->forward[i];
         updates[i]->forward[i] = newnode;
     }
+    size ++;
     return newnode;
 }
 
-int Skiplist::randomLv() {
+int MemTable::randomLv() {
     int lv = 1;
     while(dis(gen) <= SKIPLIST_P && lv < MAX_SKIPLIST_LEVEL){
         lv ++;
@@ -76,98 +152,130 @@ int Skiplist::randomLv() {
     return lv;
 }
 
-bool Skiplist::erase(u64 key) {
-    std::vector<SSEntry *> updates(MAX_SKIPLIST_LEVEL, nullptr);
-    SSEntry *cur = head;
+// try delete a key, return true if it exists
+bool MemTable::erase(u64 key) {
+    MemEntry *ent;
+    bool found = false;
 
-    for (int i = maxLevel - 1; i >= 0; i--) {
-        while (cur->forward[i] && cur->forward[i]->key < key) {
-        cur = cur->forward[i];
+    ent = search_live(key);
+    if (ent) {
+        found = true;
+    } else {
+        // not find live `key`
+        ent = search(key);
+        if (!ent) {
+            ent = add(key);
         }
-        updates[i] = cur;
     }
-
-    cur = cur->forward[0];
-    if (!cur || cur->key != key) {
-        return false;
-    }
-    for (int i = 0; i < maxLevel; i++) {
-        if (updates[i]->forward[i] != cur) {
-        break;
-        // non-0 level index may overlap the `num` node
-        }
-        updates[i]->forward[i] = cur->forward[i];
-    }
-    delete cur;
-
-    while (maxLevel > 1 && head->forward[maxLevel - 1] == nullptr) {
-        maxLevel--;
-    }
-    return true;
+    ent->dead = true;
+    return found;
 }
 
+/* ******************** SSTable ******************** */
+void
+SSTable::updateKey(u64 key) {
+    head.minkey = min(key, head.minkey);
+    head.maxkey = max(key, head.maxkey);
+}
 
-SSTable::SSTable(const string &dir, const string &vlog_name) {
-    memtable = new Skiplist();
-    vlog = new VLog(vlog_name);
+void
+SSTable::loaddata() {
+    int fd;
+
+    fd = open(filename.c_str(), O_RDONLY);
+    lseek(fd, sizeof(SSTableHead), SEEK_SET);
+    read(fd, data, head.cnt * sizeof(SSEntry));
+    close(fd);
+}
+
+SSTable::SSTable(const string &filename) {
+    this->filename = filename;
+    data = nullptr;
+
+    head.cnt = 0;
+    head.minkey = -1ULL;
+    head.maxkey = 0;
+    if (useBloomFilter) {
+        maxEntries = ( MAX_SSTABLE_SIZE - BLOOM_SIZE ) / sizeof(SSEntry);
+    } else {
+        maxEntries = MAX_SSTABLE_SIZE / sizeof(SSEntry);
+    }
+
+    readSSTheader(filename, head);
+    loaddata();
+}
+
+SSTable::~SSTable() {
+    delete data;
 }
 
 void
 SSTable::put(u64 key, const std::string &value) {
-    SSEntry *ent_s;
-    u64 off_v;
-    
 
-    ent_s = memtable->search_equ(key);
-    if (ent_s == nullptr) {
-        ent_s = memtable->add(key);
-    }
-    off_v = vlog->append(key, value);
-    ent_s->offset = off_v;
-    ent_s->vlen = value.length();
-}
-
-string 
-SSTable::get(u64 key) {
-    SSEntry *ent_s;
-    u64 off_v;
-
-    ent_s = memtable->search_equ(key);
-    if (ent_s == nullptr) {
-        // cout << "there's no key " << key << endl;
-        return "";
-    }
-    off_v = ent_s->offset;
-    return vlog->get(off_v);
 }
 
 
 void
 SSTable::scan(u64 key1, u64 key2, std::list<std::pair<u64, std::string> > &list) {
-    SSEntry *ent1, *ent2, *cur;
-    string value;
-    u64 offset;
-
-    list.clear();
-    ent1 = memtable->search(key1);
-    ent2 = memtable->search(key2);
-    if (ent2->key == key2) {
-        ent2 = ent2->forward[0];
-    }
-    for (cur = ent1; cur != ent2; cur = cur->forward[0]) {
-        value = vlog->get(cur->offset);
-        list.push_back(pair<u64, string>(cur->key, value));
-    }
-
     return;
 }
 
-bool
-SSTable::del(u64 key) {
-    return memtable->erase(key);
+// may find the wrong entry (key not equal), need recheck
+SSEntry *
+SSTable::find(u64 key) {
+    if (!(head.minkey <= key && key <= head.maxkey)) {
+        cerr << "try to get a key not in range" << endl;
+        return (SSEntry *)(data + sizeof(SSTableHead));
+    }
+    int lo, hi, mid;
+    SSEntry *sents;
+
+    // binary search in sstable
+    lo = 0, hi = head.cnt;
+    sents = (SSEntry *)(data + sizeof(SSTableHead));
+    while (lo < hi) {
+        mid = (lo + hi) >> 1;
+        if (sents[mid].key < key) {
+            lo = mid + 1;
+        } else if (sents[mid].key > key) {
+            hi = mid;
+        } else {
+            break;
+        }
+    }
+    return sents + mid;
 }
 
 
+// convert data from memtable into bytes
+void
+SSTable::convert(MemTable *memtable) {
+    if (!memtable) {
+        cerr << "no valid memtable to convert" << endl;
+        data = nullptr;
+        return;
+    }
+    MemEntry *ment;
+    int cnt = 0;
+
+    if (data)
+        delete data;
+    data = new u8[sizeof(SSTableHead) + memtable->size * sizeof(SSEntry)];
+    // write header
+    memcpy(data, &head, sizeof(SSTableHead));
+
+    // write bloom filter
+
+    // write data
+    ment = memtable->head->forward[0];
+    while (ment) {
+        memcpy(data + sizeof(SSTableHead) + cnt * sizeof(SSEntry), &ment->sent, sizeof(SSEntry));
+        ment = ment->forward[0];
+        cnt += 1;
+    }
+}
+
+/* ******************** VLog ******************** */
 bool
 VLog::createfile() {
     int fd;
@@ -239,27 +347,64 @@ VLog::get(u64 offset) {
         cerr << "magic number check fail!" << endl;
         return "";
     }
-    checksum = loadint(header + 1, 2);
-    key = loadint(header + 3, 8);
-    vlen = (int)loadint(header + 11, 4);
+    checksum = loadu(header + 1, 2);
+    key = loadu(header + 3, 8);
+    vlen = (int)loadu(header + 11, 4);
 
     bytes = new u8[vlen];
     read(fd, bytes, vlen);
     value = string(bytes, bytes + vlen);
     delete [] bytes;
+    bytes = nullptr;
 
     // checksum
     
     return value;
 }
 
-KVStore::KVStore(const std::string &dir, const std::string &vlog) : KVStoreAPI(dir, vlog)
+/* ******************** KVStore ******************** */
+// gather current max level, timestamp from sstable file(s)
+// void
+// KVStore::gatherinfo() {
+//     vector<string> subdirs, ssfiles;
+//     string dir;
+//     vector<int> levels;
+//     int minlevel, maxlevel;
+//     SSTableHead head;
+
+//     utils::scanDir(curdir, subdirs);
+    
+//     for (string subdir : subdirs) {
+//         if (subdir.substr(0, 5).compare("level") == 0) {
+//             levels.push_back(stoi(subdir.substr(5)));
+//         }
+//     }
+//     sort(levels.begin(), levels.end());
+//     minlevel = levels[0];
+//     maxlevel = *levels.rbegin();
+//     dir = curdir + "/level" + to_string(minlevel) + "/";
+//     utils::scanDir(dir, ssfiles);
+//     for (string filename : ssfiles) {
+//         size_t len = filename.length();
+//         if (len >= 4 && filename.substr(len - 4).compare(".sst") == 0) {
+//             readSSTheader(dir + filename, head);
+//             timestamp = max(head.timestamp, timestamp);
+//         }
+//     }
+// }
+
+KVStore::KVStore(const std::string &dir, const std::string &vlog) : KVStoreAPI(dir, vlog), curdir(dir)
 {
-	sstable = new SSTable(dir, vlog);
+	curdir = dir;
+    vlog_name = vlog;
+    memtable = new MemTable();
+    this->vlog = new VLog(vlog_name);
+
 }
 
 KVStore::~KVStore()
 {
+    delete memtable;
 }
 
 /**
@@ -268,7 +413,84 @@ KVStore::~KVStore()
  */
 void KVStore::put(uint64_t key, const std::string &s)
 {
-	sstable->put(key, s);
+    MemEntry *ment;
+    u64 off_v;
+
+    ment = memtable->search(key);
+    if (ment == nullptr) {
+        ment = memtable->add(key);
+    } else if (ment->dead) {
+        ment->dead = false;
+    }
+    off_v = vlog->append(key, s);
+    ment->sent.offset = off_v;
+    ment->sent.vlen = s.length();
+}
+
+// find the key in sstable, return the `SSEntry`
+SSEntry *
+KVStore::find_sstable(u64 key) {
+    // find in sstable
+    vector<string> sstfiles;
+    int ret;
+    SSTableHead head;
+    SSTable *sstable;
+    SSEntry *sent;
+
+    for (int level = 0; ;level++) {
+        ret = getsstfiles(curdir, level, sstfiles);
+        if (ret != 0) {
+            break;
+        }
+        for (string sstfile : sstfiles) {
+            readSSTheader(sstfile, head);
+            if (head.minkey <= key && key <= head.maxkey) {
+                sstable = new SSTable(sstfile);
+                sent = sstable->find(key);
+                if (sent->key == key && sent->vlen > 0) {
+                    // vlen == 0 means it's deleted
+                    return sent;
+                }
+                delete sstable;
+            }
+        }
+    }
+    return nullptr;
+}
+
+void
+KVStore::find_sstable_range(u64 key1, u64 key2, vector<SSEntry> &sents, set<u64> &viskey) {
+    vector<string> sstfiles;
+    int ret;
+    u32 cnt;
+    SSTableHead head;
+    SSTable *sstable;
+    SSEntry *sent;
+
+    for (int level = 0; ;level++) {
+        ret = getsstfiles(curdir, level, sstfiles);
+        if (ret != 0) {
+            break;
+        }
+        for (string sstfile : sstfiles) {
+            readSSTheader(sstfile, head);
+            if (head.maxkey < key2 || head.minkey > key1) {
+                continue;
+            }
+
+            sstable = new SSTable(sstfile);
+            sent = (SSEntry *)(sstable->data + sizeof(SSTableHead));
+            cnt = head.cnt;
+            for (int i = 0; i < cnt; i++) {
+              if (key1 <= sent->key && sent->key <= key2 && sent->vlen > 0 &&
+                  viskey.find(sent->key) == viskey.end()) {
+                sents.push_back(*sent);
+                viskey.insert(sent->key);
+              }
+            }
+            delete sstable;
+        }
+    }
 }
 /**
  * Returns the (string) value of the given key.
@@ -276,7 +498,26 @@ void KVStore::put(uint64_t key, const std::string &s)
  */
 std::string KVStore::get(uint64_t key)
 {
-	return sstable->get(key);
+    MemEntry *ment;
+    u64 off_v;
+
+    ment = memtable->search_live(key);
+    if (ment) {
+        off_v = ment->sent.offset;
+        return vlog->get(off_v);
+    }
+
+    // find in sstable
+    u64 offset;
+    SSEntry *sent;
+
+    sent = find_sstable(key);
+    if (sent) {
+        offset = sent->offset;
+        delete sent;
+        return vlog->get(offset);
+    }
+    return "";
 }
 /**
  * Delete the given key-value pair if it exists.
@@ -284,7 +525,20 @@ std::string KVStore::get(uint64_t key)
  */
 bool KVStore::del(uint64_t key)
 {
-	return sstable->del(key);
+    bool found;
+    int level;
+    SSEntry *sent;
+
+    found = memtable->erase(key); // here's a problem, if not exist in sstable, still a delete record will be inserted into memtable
+    if (found) {
+        return found;
+    }
+
+    sent = find_sstable(key);
+    if (sent == nullptr) {
+        return false;
+    }
+    return true;
 }
 
 /**
@@ -302,7 +556,39 @@ void KVStore::reset()
  */
 void KVStore::scan(uint64_t key1, uint64_t key2, std::list<std::pair<uint64_t, std::string>> &list)
 {
-	sstable->scan(key1, key2, list);
+    vector<SSEntry> sents;
+	MemEntry *ent1, *ent2, *cur;
+    set<u64> viskey;
+    string value;
+    u64 offset;
+
+    // scan memtable
+    list.clear();
+    ent1 = memtable->search_less(key1);
+    ent2 = memtable->search_less(key2);
+    if (ent2->sent.key == key2) {
+        ent2 = ent2->forward[0];
+    }
+    for (cur = ent1; cur != ent2; cur = cur->forward[0]) {
+        if (cur->dead == false && viskey.find(cur->sent.key) == viskey.end()) {
+            sents.push_back(cur->sent);
+            viskey.insert((cur->sent.key));
+        }
+        // value = vlog->get(cur->sent.offset);
+        // list.push_back(pair<u64, string>(cur->sent.key, value));
+    }
+
+    // scan sstables
+    find_sstable_range(key1, key2, sents, viskey);
+
+
+    sort(sents.begin(), sents.end(), compare_ssentry);
+    for (SSEntry sent : sents) {
+        value = vlog->get(sent.offset);
+        list.push_back(pair<u64, string>(sent.key, value));
+    }
+
+    return;
 }
 
 /**
