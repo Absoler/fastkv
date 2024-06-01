@@ -21,6 +21,10 @@
 #define u8 unsigned char
 
 /* ******************** my utils ******************** */
+extern bool useBloomFilter;
+extern bool useCache;
+extern size_t maxSSEntry;
+
 enum KEY_STATE {LIVE, DEAD, NOT_FOUND};
 u64 loadu(u8 *bytes, int n);
 void storeu(u8 *bytes, u64 value, int n);

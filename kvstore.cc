@@ -8,7 +8,8 @@
 using namespace std;
 
 /* ******************** my utils ******************** */
-bool useBloomFilter;
+bool useBloomFilter = false;
+bool useCache = true;
 size_t maxSSEntry;
 u64 gtimestamp; // sequence number of SSTable
 string datadir;
@@ -232,7 +233,7 @@ MemTable::erase(u64 key) {
 
 bool
 MemTable::full() {
-    return size >= maxSSEntry;
+    return (!useCache) || size >= maxSSEntry;
 }
 
 /* ******************** SSTable ******************** */
@@ -722,7 +723,7 @@ KVStore::find_sstable_range(u64 key1, u64 key2, vector<SSEntry> &sents, set<u64>
         
         for (string sstfile : sstfiles) {
             readSSTheader(sstfile, head);
-            if (head.maxkey < key2 || head.minkey > key1) {
+            if (head.maxkey < key1 || head.minkey > key2) {
                 continue;
             }
 
