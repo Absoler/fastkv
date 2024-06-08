@@ -14,6 +14,7 @@ size_t maxSSEntry;
 u64 gtimestamp; // sequence number of SSTable
 string datadir;
 
+// 判断intervals中记录的区间是否和range相交
 bool in_intervals(const vector<pair<u64, u64>> &intervals, pair<u64, u64> range) {
     for (auto pir : intervals) {
         if (pir.first <= range.first && range.first <= pir.second || pir.first <= range.second && range.second <= pir.second) {
@@ -23,6 +24,7 @@ bool in_intervals(const vector<pair<u64, u64>> &intervals, pair<u64, u64> range)
     return false;
 }
 
+// 两个工具函数，用来从字节流中读写一个整数，例如十进制数256，在写成十六进制（小端模式下）就是 0x00, 0x01，前面一个字节是低位字节
 // little endian load
 u64 loadu(u8 *bytes, int n) {
     u64 val = 0;
@@ -54,6 +56,7 @@ compare_sent_pir(const Sent_pir &p1, const Sent_pir &p2) {
         return p1.second->timestamp < p2.second->timestamp;
 }
 // read a sstable header from given filename
+// 读一个SSTable的header出来到head变量中，header的定义参照pdf
 int
 readSSTheader(const std::string &filename, SSTableHead &head) {
     int fd;
@@ -75,6 +78,7 @@ inline bool existLevelDir(const std::string &dir, int level) {
 }
 
 // get sstable filenames from given level, if no .sst files, return 1
+// sstable文件是分层存放的，这个函数用来读取给定层的ssttable文件路径
 int getsstfiles(const string &dir, int level, list<string> &sstfiles) {
     vector<string> files;
     string subdir = dir + "/level-" + to_string(level) + "/";
@@ -95,6 +99,7 @@ int getsstfiles(const string &dir, int level, list<string> &sstfiles) {
 
 // select old sstfiles more than 2^(level+1), return false if no need
 // if over limit, level-0 should all be merged
+// 选出给定层有哪些文件是多出来需要合并到下一层的（优先淘汰时间戳小的）。
 bool selectolds(std::list<std::string> &sstfiles, int level) {
     int more = sstfiles.size() - (2<<level);
     SSTableHead head;
@@ -108,6 +113,7 @@ bool selectolds(std::list<std::string> &sstfiles, int level) {
         return false;
     }
 
+    // 记录下每个文件的时间戳，然后排序，优先剔除选出小的
     for (string filename : sstfiles) {
         readSSTheader(filename, head);
         if (timemap.find(head.timestamp) == timemap.end()) {
@@ -151,6 +157,7 @@ MemTable::~MemTable() {
 
 
 // the next of the closet less element
+// 从跳表中选出不大于key的元素
 MemEntry *
 MemTable::search_noless(u64 key) {
     MemEntry *cur = this->head;
@@ -218,8 +225,10 @@ MemTable::erase(u64 key) {
     MemEntry *ent;
     KEY_STATE state;
 
+    // 删除节点就是在跳表中选出他然后标记为dead
     state = search(key, ent);
     if (state == NOT_FOUND) {
+        // 如果没有这个key，就插入一个新的
         // not find live `key`
         ent = add(key);
         // not add "~delete"
@@ -239,10 +248,11 @@ MemTable::full() {
 /* ******************** SSTable ******************** */
 void
 SSTable::updateKey(u64 key) {
+    // 更新当前sstable的最大最小key，用来get的时候查
     head.minkey = min(key, head.minkey);
     head.maxkey = max(key, head.maxkey);
 }
-
+// 按照filename的内容把对应文件加载进内存
 void
 SSTable::loadsents() {
     int fd;
@@ -313,6 +323,7 @@ int SSTable::setdata(std::vector<SSEntry> &sent_vec, size_t start, size_t end) {
 }
 
 // may find the wrong entry (key not equal), need recheck
+// 从sstable加载进内存的内容中找到给定key的ssentry
 SSEntry *
 SSTable::find(u64 key) {
     if (!(head.minkey <= key && key <= head.maxkey)) {
@@ -412,7 +423,7 @@ VLog::createfile() {
     close(fd);
     return true;
 }
-
+// 在vlog文件后附加一个新的value
 u64
 VLog::append(u64 key, const std::string &value) {
     if (!utils::dirExists(filename)) {
@@ -428,7 +439,7 @@ VLog::append(u64 key, const std::string &value) {
     u16 checksum;
     int fd, len;
     u64 offset;
-
+    // 这里存数据的格式遵循pdf上的ventry
 	for (int i = 0; i < 8; i++) {
 		content[i] = 0xff & (key >> (i*8));
 	}
@@ -444,6 +455,7 @@ VLog::append(u64 key, const std::string &value) {
     offset = lseek(fd, 0, SEEK_END);
     len = content.size() + 3;
     bytes = new u8[len];
+    // 构建ventry的头部
     bytes[0] = magic;
     bytes[1] = checksum & 0xff;
     bytes[2] = checksum & 0xff00;
@@ -454,7 +466,7 @@ VLog::append(u64 key, const std::string &value) {
 
     return offset;
 }
-
+// 根据偏移量和打开的文件描述符读取一个ventry出来
 VEntry
 VLog::readvent(u64 offset, int fd) {
     int vlen, ret;
@@ -532,6 +544,7 @@ int KVStore::merge(list<SSTable *> &stab_lst, int tolevel) {
         assert(sent != nullptr);
         heap.push(make_pair(sent, stab));
     }
+    // merge的时候采用多路归并排序的方法，搞一个堆，堆顶是最小key的元素，然后每次将其加进新sstable
     while(!heap.empty()) {
         sent_pir = heap.top();
         heap.pop();
@@ -550,6 +563,7 @@ int KVStore::merge(list<SSTable *> &stab_lst, int tolevel) {
             heap.push(make_pair(sent, sent_pir.second));
         }
     }
+    // 合并完的文件删掉。只保留新文件
     for (SSTable * stab : stab_lst) {
         utils::rmfile(stab->filename);
         delete stab;
@@ -573,6 +587,7 @@ int KVStore::merge(list<SSTable *> &stab_lst, int tolevel) {
 
 // call this when memtable is full, this function will store the memtable and compact from the level-0
 // all processed object will be deleted and reset to nullptr.
+// 跳表满了之后需要将其内容合并至sstable文件，逐层向下合入
 int
 KVStore::compact() {
     SSTable *stab;
@@ -589,7 +604,7 @@ KVStore::compact() {
     
     for (int tolevel = 1; ; tolevel++) {
         getsstfiles(datadir, tolevel - 1, sstfiles);
-        
+        // 选出要向下合入的文件
         more = selectolds(sstfiles, tolevel - 1);
 
         if (!more) {
@@ -603,6 +618,7 @@ KVStore::compact() {
         }
 
         // select sstfiles in tolevel intersected with ranges of `extra`
+        // 选出下一层有哪些文件位于上面那些文件的key区间，这是需要合并在一起的对象
         getsstfiles(datadir, tolevel, tolevelfiles);
         for (string filename : tolevelfiles) {
             readSSTheader(filename, head);
@@ -655,6 +671,7 @@ KVStore::~KVStore()
  * Insert/Update the key-value pair.
  * No return values for simplicity.
  */
+ // 添加新key-value的时候直接加进跳表即可
 void KVStore::put(uint64_t key, const std::string &s)
 {
     MemEntry *ment;
@@ -715,6 +732,7 @@ KVStore::find_sstable_range(u64 key1, u64 key2, vector<SSEntry> &sents, set<u64>
     SSTable *sstable;
     SSEntry *sent;
 
+    // 遍历所有sstable文件，根据最小最大值判断key是否可能存在，然后再读出来去找
     for (int level = 0; ;level++) {
         if (!existLevelDir(datadir, level)) {
             break;
@@ -744,6 +762,7 @@ KVStore::find_sstable_range(u64 key1, u64 key2, vector<SSEntry> &sents, set<u64>
 }
 
 // get SSEntry instead of value, return 0 when find the key
+// 寻找一个key时，先在跳表里找，再在sstable里找
 KEY_STATE
 KVStore::get_sent(uint64_t key, SSEntry &sent) {
     MemEntry *ment;
@@ -801,9 +820,11 @@ bool KVStore::del(uint64_t key)
     if (state == LIVE) {
         return true;
     }
+    // 如果内存中找到，则根据是否dead返回
     if (state == DEAD) {
         return false;
     }
+    // 否则，就再去sstable里找一下
     sent = find_sstable(key);
     if (sent == nullptr) {
         return false;
