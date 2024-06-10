@@ -927,13 +927,16 @@ void KVStore::gc(uint64_t chunk_size)
     utils::de_alloc_file(vlog_name, start_off, offset - start_off);
 
     // re-insert fresh vlog
+    // 将取出的字符串值重新插入
     for (auto pir : vents) {
         key = pir.second.key;
         ret = get_sent(key, sent);
+        // 如果发现该key现在查出的值和当前ventry不是同一个，那当前这个ventry可以丢弃，不插入
         if (ret == LIVE && sent.offset != pir.first) {
             // find but point to another vlog entry, discard it
             continue;
         }
+        // 重新将ventry插入
         put(key, pir.second.value);
     }
     compact();
