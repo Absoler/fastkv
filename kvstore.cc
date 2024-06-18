@@ -26,13 +26,18 @@ int getlevel(const string &path) {
     return stoi(match.str(1));
 }
 
-bool in_intervals(const vector<pair<u64, u64>> &intervals, pair<u64, u64> range) {
-    for (auto pir : intervals) {
-        if (pir.first <= range.first && range.first <= pir.second || pir.first <= range.second && range.second <= pir.second) {
-            return true;
-        }
+// check whether intervals is intersected with `interval`
+bool intersect(const vector<pair<u64, u64>> &intervals,
+               pair<u64, u64> interval) {
+  for (auto pir : intervals) {
+    if (pir.first < interval.first && pir.second >= interval.first) {
+        return true;
     }
-    return false;
+    if (interval.first <= pir.first && interval.second >= pir.first) {
+        return true;
+    }
+  }
+  return false;
 }
 
 // little endian load
@@ -587,10 +592,10 @@ int KVStore::merge(list<SSTable *> &stab_lst, int tolevel) {
         heap.pop();
 
         key = sent_pir.first->key;
-        if (sent_pir.first->vlen > 0 && viskey.find(key) == viskey.end()) {
+        if (viskey.find(key) == viskey.end()) {
             tmpsents.push_back(*sent_pir.first);
         } else {
-            // if repeat, discard the latter key
+            // if repeat, discard the old sent
 
         }
         viskey.insert(key);
@@ -648,18 +653,20 @@ KVStore::compact() {
             break;
         }
         // current level's extra files' range
-        vector<pair<u64, u64>> ranges;
+        vector<pair<u64, u64>> intervals_lastlevel;
         for (string filename : sstfiles) {
             readSSTheader(filename, head);
-            ranges.push_back(pair<u64, u64>(head.minkey, head.maxkey));
+            intervals_lastlevel.push_back(
+                pair<u64, u64>(head.minkey, head.maxkey));
         }
 
         // select sstfiles in tolevel intersected with ranges of `extra`
         getsstfiles(datadir, tolevel, tolevelfiles);
         for (string filename : tolevelfiles) {
             readSSTheader(filename, head);
-            if (in_intervals(ranges, make_pair(head.minkey, head.maxkey))) {
-                sstfiles.push_back(filename);
+            if (intersect(intervals_lastlevel,
+                          make_pair(head.minkey, head.maxkey))) {
+              sstfiles.push_back(filename);
             }
         }
 
@@ -747,7 +754,7 @@ KVStore::find_sstable(u64 key) {
             if (head.minkey <= key && key <= head.maxkey) {
                 sstable = new SSTable(sstfile, level);
                 sent = sstable->find(key);
-                if (sent->key == key && sent->vlen > 0) {
+                if (sent->key == key) {
                     // vlen == 0 means it's deleted
                     return sent;
                 }
@@ -819,7 +826,7 @@ KVStore::get_sent(uint64_t key, SSEntry &sent) {
     sent_p = find_sstable(key);
     if (sent_p) {
         sent = *sent_p;
-        return LIVE;
+        return (sent.vlen == 0 ? DEAD : LIVE);
     }
     return NOT_FOUND;
 }
@@ -858,7 +865,7 @@ bool KVStore::del(uint64_t key)
         return false;
     }
     sent = find_sstable(key);
-    if (sent == nullptr) {
+    if (sent == nullptr || sent->vlen == 0) {
         return false;
     }
     return true;

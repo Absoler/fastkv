@@ -31,7 +31,7 @@ enum KEY_STATE {LIVE, DEAD, NOT_FOUND};
 u64 loadu(u8 *bytes, int n);
 void storeu(u8 *bytes, u64 value, int n);
 
-bool in_intervals(const std::vector<std::pair<u64, u64>> &intervals,  std::pair<u64, u64> range);
+bool intersect(const std::vector<std::pair<u64, u64>> &intervals,  std::pair<u64, u64> range);
 struct SSTableHead;
 struct SSEntry;
 bool compare_ssentry(const SSEntry &sent1, const SSEntry &sent2);
