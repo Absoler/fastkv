@@ -1,5 +1,6 @@
 #pragma once
 
+#include <iostream>
 #include <sstream>
 #include <sys/stat.h>
 #include <vector>
@@ -50,6 +51,15 @@ namespace utils
         return ret.size();
     }
 
+    static inline unsigned long getsize(const std::string &filename) {
+        struct stat st;
+        if (stat(filename.c_str(), &st) == 0) {
+            return st.st_size;
+        } else {
+            perror("can't get file size");
+            return -1;
+        }
+    }
     /**
      * Create directory
      * @param path directory to be created.

@@ -704,6 +704,27 @@ KVStore::KVStore(const std::string &dir, const std::string &vlog) : KVStoreAPI(d
     memtable = new MemTable();
     this->vlog = new VLog(vlog_name);
 
+    /* read sstfiles */
+    // load old timestamp
+    list<string> sstfiles;
+    for (int level = 0; ; level++) {
+        if (level > 0 && !existLevelDir(datadir, level)) {
+            continue;
+        }
+        getsstfiles(datadir, level, sstfiles);
+        if (sstfiles.size()) {
+            u64 timestamp = 0;
+            SSTableHead head;
+            for (string filename : sstfiles) {
+                readSSTheader(filename, head);
+                timestamp = max(timestamp, head.timestamp);
+            }
+            gtimestamp = timestamp + 1;
+            break;
+        }
+    }
+
+    // TODO: load one sst file into memory
 }
 
 KVStore::~KVStore()
