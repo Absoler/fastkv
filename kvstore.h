@@ -10,6 +10,7 @@
 #include <list>
 #include <random>
 #include <algorithm>
+#include <regex>
 
 #define MAX_SKIPLIST_LEVEL 32
 #define SKIPLIST_P 0.5
@@ -95,7 +96,7 @@ class SSTable {
     // if you delete this, remember set it to `nullptr`
     u8 *data;
     u32 slen;
-    int level;
+    int tolevel;
     int setdata(std::vector<SSEntry> &sents, size_t start, size_t end);
     int save();
     SSEntry *get_content();

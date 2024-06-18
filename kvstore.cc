@@ -6,6 +6,7 @@
 #include <cstring>
 #include <fcntl.h>
 #include <iostream>
+#include <regex>
 #include <string>
 #include <sys/types.h>
 #include <unistd.h>
@@ -17,6 +18,13 @@ bool useCache = true;
 size_t maxSSEntry;
 u64 gtimestamp; // sequence number of SSTable
 string datadir;
+regex level_re("/level-(\\d+)/");
+
+int getlevel(const string &path) {
+    smatch match;
+    regex_search(path, match, level_re);
+    return stoi(match.str(1));
+}
 
 bool in_intervals(const vector<pair<u64, u64>> &intervals, pair<u64, u64> range) {
     for (auto pir : intervals) {
@@ -54,8 +62,11 @@ bool
 compare_sent_pir(const Sent_pir &p1, const Sent_pir &p2) {
     if (p1.first->key != p2.first->key)
         return p1.first->key > p2.first->key;
-    else
+    else if (p1.second->head.timestamp != p2.second->head.timestamp)
         return p1.second->head.timestamp < p2.second->head.timestamp;
+    else {
+        return getlevel(p1.second->filename) > getlevel(p2.second->filename);
+    }
 }
 // read a sstable header from given filename
 int
@@ -262,7 +273,7 @@ SSTable::loadsents() {
 
 SSTable::SSTable(const string &filename, int level, bool needloadsents = true) {
     this->filename = filename;
-    this->level = level;
+    this->tolevel = level;
     data = nullptr;
 
 
@@ -287,8 +298,8 @@ int
 SSTable::save() {
     int fd;
     
-    if (!utils::dirExists(datadir + "/level-" + to_string(level))) {
-        utils::mkdir(datadir + "/level-" + to_string(level) + "/");
+    if (!utils::dirExists(datadir + "/level-" + to_string(tolevel))) {
+        utils::mkdir(datadir + "/level-" + to_string(tolevel) + "/");
     }
     fd = open(filename.c_str(), O_WRONLY | O_CREAT, 0644);
     write(fd, data, slen);
