@@ -154,7 +154,7 @@ public:
 
     int merge(std::list<SSTable *> &stabs, int tolevel);
     int compact();
-    int check_compact();
+    int check_compact(bool force);
 
 	void put(uint64_t key, const std::string &s) override;
 

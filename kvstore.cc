@@ -556,7 +556,7 @@ int KVStore::merge(list<SSTable *> &stab_lst, int tolevel) {
     Sent_pir sent_pir;
     vector<SSEntry> tmpsents;
     set<u64> viskey;
-    u64 key;
+    u64 key, timestamp = 0;
     SSTable *stab;
     SSEntry *sents, *sent;
     u32 cnt;
@@ -566,8 +566,9 @@ int KVStore::merge(list<SSTable *> &stab_lst, int tolevel) {
     /* multi merge */
     for (SSTable * stab : stab_lst) {
         sent = stab->get_next();
-        // assert(sent != nullptr);
-        if (sent)
+        assert(sent != nullptr);
+        timestamp = max(timestamp, stab->head.timestamp);
+        // if (sent)
         heap.push(make_pair(sent, stab));
     }
     while(!heap.empty()) {
@@ -602,6 +603,7 @@ int KVStore::merge(list<SSTable *> &stab_lst, int tolevel) {
         filename = subdir + to_string(tmpsents[i].key) + "_" + to_string(tmpsents[j - 1].key) + ".sst";
 
         stab = new SSTable(filename, tolevel, false);
+        stab->head.timestamp = timestamp;
         stab_lst.push_back(stab);
         stab->setdata(tmpsents, i, j);
     }
@@ -615,6 +617,7 @@ KVStore::compact() {
     SSTable *stab;
     SSTableHead head;
     list<SSTable *> stabs;
+    // sstfiles contains files need merged, from current level and the next level
     list<string> sstfiles, tolevelfiles;
     bool more = false;
 
@@ -622,6 +625,7 @@ KVStore::compact() {
     stab->convert(memtable);
     stab->save();
     delete memtable;
+    delete stab;
     memtable = new MemTable();
     
     for (int tolevel = 1; ; tolevel++) {
@@ -632,7 +636,7 @@ KVStore::compact() {
         if (!more) {
             break;
         }
-
+        // current level's extra files' range
         vector<pair<u64, u64>> ranges;
         for (string filename : sstfiles) {
             readSSTheader(filename, head);
@@ -657,15 +661,15 @@ KVStore::compact() {
         for (SSTable * stab : stabs) {
             delete stab;
         }
-    stabs.clear();
+        stabs.clear();
     }
     // free memory
     return 0;
 }
 
 int
-KVStore::check_compact() {
-    if (memtable->full()) {
+KVStore::check_compact(bool force = false) {
+    if (memtable->full() || force && memtable->size > 0) {
         compact();
     }
     return 0;
@@ -924,9 +928,9 @@ void KVStore::scan(uint64_t key1, uint64_t key2, std::list<std::pair<uint64_t, s
  */
 void KVStore::gc(uint64_t chunk_size)
 {
-    list<pair<u64, VEntry>> vents;
+    list<pair<u64, VEntry>> vents;  // the first element is the real offset
     VEntry vent;
-    off_t start_off, offset;
+    off_t start_off, offset, filesize;
     int fd, ret;
     u64 key;
     SSEntry sent;
@@ -934,9 +938,10 @@ void KVStore::gc(uint64_t chunk_size)
     // fetch some data into mem and free the corresponding disk space
     start_off = vlog->get_start_off();
     offset = start_off;
+    filesize = utils::getsize(vlog_name);
     fd = open(vlog_name.c_str(), O_RDONLY);
 
-    while (offset - start_off < chunk_size) {
+    while (offset < filesize && offset - start_off < chunk_size) {
         ret = vlog->readvent(offset, fd, vent);
         if (ret != 0) {
             break;
@@ -952,11 +957,13 @@ void KVStore::gc(uint64_t chunk_size)
     for (auto pir : vents) {
         key = pir.second.key;
         ret = get_sent(key, sent);
-        if (ret != LIVE || ret == LIVE && sent.offset != pir.first || sent.vlen == 0) {
-            // find but point to another vlog entry, discard it
+        if (ret != LIVE || sent.vlen == 0 || sent.offset != pir.first) {
+            // discard the value when:
+            // 1. key is delete or not found
+            // 2. value is old, the key has pointed to the newer value
             continue;
         }
         put(key, pir.second.value);
     }
-    compact();
+    check_compact(true);
 }
