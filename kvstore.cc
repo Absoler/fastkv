@@ -1,10 +1,14 @@
 #include "kvstore.h"
 #include "utils.h"
 #include <cassert>
+#include <cerrno>
+#include <cstdio>
 #include <cstring>
 #include <fcntl.h>
 #include <iostream>
 #include <string>
+#include <sys/types.h>
+#include <unistd.h>
 using namespace std;
 
 /* ******************** my utils ******************** */
@@ -51,7 +55,7 @@ compare_sent_pir(const Sent_pir &p1, const Sent_pir &p2) {
     if (p1.first->key != p2.first->key)
         return p1.first->key > p2.first->key;
     else
-        return p1.second->timestamp < p2.second->timestamp;
+        return p1.second->head.timestamp < p2.second->head.timestamp;
 }
 // read a sstable header from given filename
 int
@@ -261,16 +265,17 @@ SSTable::SSTable(const string &filename, int level, bool needloadsents = true) {
     this->level = level;
     data = nullptr;
 
-    head.cnt = 0;
-    head.minkey = -1ULL;
-    head.maxkey = 0;
 
-    this->timestamp = gtimestamp;
-    gtimestamp++;
     if (needloadsents) {
         readSSTheader(filename, head);
         loadsents();
         curp = get_content();
+    } else {
+        head.cnt = 0;
+        head.minkey = -1ULL;
+        head.maxkey = 0;
+        head.timestamp = gtimestamp;
+        gtimestamp++;
     }
 }
 
@@ -296,7 +301,7 @@ int SSTable::setdata(std::vector<SSEntry> &sent_vec, size_t start, size_t end) {
     SSEntry *sent;
     int fd;
 
-    head = (SSTableHead){timestamp, end - start, sent_vec[start].key,
+    head = (SSTableHead){head.timestamp, end - start, sent_vec[start].key,
                         sent_vec[end - 1].key};
     slen = sizeof(SSEntry) * (end - start) + sizeof(SSTableHead);
     data = new u8[slen];
@@ -406,7 +411,7 @@ VLog::createfile() {
 
     fd = open(filename.c_str(), O_WRONLY | O_CREAT, 0644);
     if (fd == -1) {
-        cerr << "can't create VLog file" << endl;
+        cerr << "can't create VLog file with errno " << errno << endl;
         return false;
     }
     close(fd);
@@ -455,17 +460,39 @@ VLog::append(u64 key, const std::string &value) {
     return offset;
 }
 
-VEntry
-VLog::readvent(u64 offset, int fd) {
+off_t
+VLog::get_start_off() {
+    off_t base, off;
+    int fd;
+    u8 tmp[1];
+
+    base = utils::seek_data_block(filename);
+    fd = open(filename.c_str(), O_RDWR);
+    lseek(fd, base, SEEK_SET);
+    for (off = base; off < base + BLOCK_SIZE; off++) {
+        read(fd, tmp, 1);
+        if (tmp[0] == 0xff) {
+            break;
+        }
+    }
+    return off;
+}
+
+int
+VLog::readvent(u64 offset, int fd, VEntry &vent) {
     int vlen, ret;
     string value;
     u8 header[15], *bytes;
     u16 checksum;
     u64 key;
+    vector<u8> content(12, 0);
 
-    ret = lseek(fd, offset, SEEK_SET);
-    read(fd, header, 15);
-    
+    lseek(fd, offset, SEEK_SET);
+    ret = read(fd, header, 15);
+    if (ret <= 0) {
+        cerr << "read vlog entry EOF or err with: " << ret << endl;
+        return -1;
+    }
     checksum = loadu(header + 1, 2);
     key = loadu(header + 3, 8);
     vlen = (int)loadu(header + 11, 4);
@@ -473,10 +500,20 @@ VLog::readvent(u64 offset, int fd) {
     bytes = new u8[vlen];
     read(fd, bytes, vlen);
     value = string(bytes, bytes + vlen);
+
+    for (int i = 0; i < 8; i++) {
+		content[i] = 0xff & (key >> (i*8));
+	}
+    for (int i = 0; i < 4; i++) {
+		content[i+8] = 0xff & (value.length() >> (i*8));
+	}
+    for (char c : value) {
+        content.push_back((u8)c);
+    }
     delete [] bytes;
 
-    VEntry vent(key, vlen, move(value));
-    return vent;
+    vent = VEntry(key, vlen, move(value));
+    return 0;
 }
 string
 VLog::get(u64 offset) {
@@ -491,8 +528,8 @@ VLog::get(u64 offset) {
     ret = lseek(fd, offset, SEEK_SET);
     read(fd, header, 15);
     if (header[0] != 0xff) {
-        cout << offset << " " << (int)header[0] << " " << errno << endl;
-        cerr << "magic number check fail!" << endl;
+        // cout << offset << " " << (int)header[0] << " " << errno << endl;
+        // cerr << "magic number check fail!" << endl;
         return "";
     }
     checksum = loadu(header + 1, 2);
@@ -529,7 +566,8 @@ int KVStore::merge(list<SSTable *> &stab_lst, int tolevel) {
     /* multi merge */
     for (SSTable * stab : stab_lst) {
         sent = stab->get_next();
-        assert(sent != nullptr);
+        // assert(sent != nullptr);
+        if (sent)
         heap.push(make_pair(sent, stab));
     }
     while(!heap.empty()) {
@@ -539,14 +577,13 @@ int KVStore::merge(list<SSTable *> &stab_lst, int tolevel) {
         key = sent_pir.first->key;
         if (sent_pir.first->vlen > 0 && viskey.find(key) == viskey.end()) {
             tmpsents.push_back(*sent_pir.first);
-            viskey.insert(key);
         } else {
             // if repeat, discard the latter key
 
         }
+        viskey.insert(key);
         sent = sent_pir.second->get_next();
         if (sent) {
-            assert(sent != nullptr);
             heap.push(make_pair(sent, sent_pir.second));
         }
     }
@@ -613,15 +650,16 @@ KVStore::compact() {
 
         // merge them
         for (string filename : sstfiles) {
-            stabs.push_back(new SSTable(filename, tolevel, true));
+            stabs.push_back(new SSTable(filename, tolevel));
         }
         merge(stabs, tolevel);
         
+        for (SSTable * stab : stabs) {
+            delete stab;
+        }
+    stabs.clear();
     }
     // free memory
-    for (SSTable * stab : stabs) {
-        delete stab;
-    }
     return 0;
 }
 
@@ -781,7 +819,7 @@ std::string KVStore::get(uint64_t key)
     int ret;
 
     ret = get_sent(key, sent);
-    if (ret != LIVE) {
+    if (ret != LIVE || sent.vlen == 0) {
         return "";
     } else {
         return vlog->get(sent.offset);
@@ -887,18 +925,23 @@ void KVStore::scan(uint64_t key1, uint64_t key2, std::list<std::pair<uint64_t, s
 void KVStore::gc(uint64_t chunk_size)
 {
     list<pair<u64, VEntry>> vents;
+    VEntry vent;
     off_t start_off, offset;
     int fd, ret;
     u64 key;
     SSEntry sent;
 
     // fetch some data into mem and free the corresponding disk space
-    start_off = utils::seek_data_block(vlog_name);
+    start_off = vlog->get_start_off();
     offset = start_off;
     fd = open(vlog_name.c_str(), O_RDONLY);
 
     while (offset - start_off < chunk_size) {
-        vents.push_back(make_pair(offset, vlog->readvent(offset, fd)));
+        ret = vlog->readvent(offset, fd, vent);
+        if (ret != 0) {
+            break;
+        }
+        vents.push_back(make_pair(offset, vent));
         offset += vents.back().second.size();
     }
 
@@ -909,7 +952,7 @@ void KVStore::gc(uint64_t chunk_size)
     for (auto pir : vents) {
         key = pir.second.key;
         ret = get_sent(key, sent);
-        if (ret == LIVE && sent.offset != pir.first) {
+        if (ret != LIVE || ret == LIVE && sent.offset != pir.first || sent.vlen == 0) {
             // find but point to another vlog entry, discard it
             continue;
         }

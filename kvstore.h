@@ -19,6 +19,7 @@
 #define u32 unsigned int
 #define u16 unsigned short
 #define u8 unsigned char
+#define BLOCK_SIZE 4096
 
 /* ******************** my utils ******************** */
 extern bool useBloomFilter;
@@ -89,7 +90,6 @@ class SSTable {
     unsigned char bloom[1<<13];
     std::string vlog_name;
     std::string filename;
-    u64 timestamp;
 
     // this must be deleted in time
     // if you delete this, remember set it to `nullptr`
@@ -117,6 +117,7 @@ class VEntry {
     int vlen;
     std::string value;
 
+    VEntry(): key(-1), checksum(-1), value("") {}
     VEntry(u64 _key, int _vlen, const std::string &s)
         : key(_key), vlen(_vlen), value(s){}
     size_t size() const;
@@ -131,8 +132,9 @@ class VLog {
     ~VLog();
 
     bool createfile();
+    off_t get_start_off();
     u64 append(u64 key, const std::string &value); // return the offset
-    VEntry readvent(u64 offset, int fd);
+    int readvent(u64 offset, int fd, VEntry &vent);
     std::string get(u64 offset);    // get the value
 
 };
