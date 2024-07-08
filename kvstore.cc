@@ -709,7 +709,7 @@ KVStore::KVStore(const std::string &dir, const std::string &vlog) : KVStoreAPI(d
     list<string> sstfiles;
     for (int level = 0; ; level++) {
         if (level > 0 && !existLevelDir(datadir, level)) {
-            continue;
+            break;
         }
         getsstfiles(datadir, level, sstfiles);
         if (sstfiles.size()) {
